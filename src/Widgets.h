@@ -97,12 +97,15 @@ struct TableWidget {
 	GfxResourceID vb;
 	cc_bool pendingClose, everCreated;
 	float scale;
+	int topMargin;
 
 	BlockID blocks[BLOCK_COUNT];
 	struct ScrollbarWidget scroll;
 	int lastX, lastY, paddingX;
 	int paddingL, paddingR, paddingT, paddingB;
 	void (*UpdateTitle)(BlockID block);
+	cc_string searchFilter;
+	int pageIdx, pageTotal;
 
 	int state[TABLE_MAX_VERTICES / 4];
 	int verticesCount;

@@ -18,6 +18,7 @@
 #include "Input.h"
 #include "InputHandler.h"
 #include "Launcher.h"
+#include "Stream.h"
 
 static void Widget_NullFunc(void* widget) { }
 static int  Widget_Pointer(void* elem, int id, int x, int y) { return false; }
@@ -731,13 +732,16 @@ static int Table_Width(struct TableWidget* w)  { return w->width  + w->paddingL 
 static int Table_Height(struct TableWidget* w) { return w->height + w->paddingT + w->paddingB; }
 
 static cc_bool TableWidget_GetCoords(struct TableWidget* w, int i, int* cellX, int* cellY) {
-	int x, y;
-	x = i % w->blocksPerRow;
-	y = i / w->blocksPerRow - w->scroll.topRow;
+	int row = i / w->blocksPerRow;
+	int col = i % w->blocksPerRow;
+	row -= w->scroll.topRow;
 
-	*cellX = w->x + w->cellSizeX * x;
-	*cellY = w->y + w->cellSizeY * y + 3;
-	return y >= 0 && y < w->rowsVisible;
+	if (row >= 0 && row < w->rowsVisible) {
+		*cellX = w->x + col * w->cellSizeX;
+		*cellY = w->y + row * w->cellSizeY;
+		return true;
+	}
+	return false;
 }
 
 static void TableWidget_MoveCursorToSelected(struct TableWidget* w) {
@@ -762,7 +766,7 @@ static void TableWidget_RecreateTitle_Internal(struct TableWidget* w, cc_bool fo
 	} else {
 		block = (BlockID)titleBlock;
 	}
-	w->UpdateTitle(block);
+	if (w->UpdateTitle) w->UpdateTitle(block);
 }
 void TableWidget_RecreateTitle(struct TableWidget* w, cc_bool force) {
 	TableWidget_RecreateTitle_Internal(w, force, -1);
@@ -771,29 +775,246 @@ void TableWidget_RecreateTitleForBlock(struct TableWidget* w, cc_bool force, int
 	TableWidget_RecreateTitle_Internal(w, force, titleBlock);
 }
 
-void TableWidget_RecreateBlocks(struct TableWidget* w) {
-	int max = Game_UseCPEBlocks ? BLOCK_MAX_DEFINED : BLOCK_MAX_ORIGINAL;
-	int i, begCount, rowEnd;
-	cc_bool emptyRow;
-	BlockID block;
-	w->blocksCount = 0;
+cc_bool inventoryFavsFilter = false;
+static BlockID favBlocks[BLOCK_COUNT];
+static int favBlocksCount = -1;
 
-	for (i = 0; i < Array_Elems(Inventory.Map);) {
-		emptyRow = true;
-		begCount = w->blocksCount;
-		rowEnd   = min(i + w->blocksPerRow, Array_Elems(Inventory.Map));
-
-		for (; i < rowEnd; i++) {
-			block = Inventory.Map[i];
-			if (block > max) continue;
-			
-			w->blocks[w->blocksCount++] = block;
-			if (block != BLOCK_AIR) emptyRow = false;
-		}
-
-		if (emptyRow) w->blocksCount = begCount;
+static void GetFavFilePath(cc_string* path) {
+	cc_uint32 hash = 0;
+	
+	if (Server.IsSinglePlayer) {
+		hash = Utils_CRC32((const cc_uint8*)Server.Name.buffer, Server.Name.length);
+	} else {
+		cc_string fullAddr; char fullAddrBuffer[256];
+		String_InitArray(fullAddr, fullAddrBuffer);
+		String_Format2(&fullAddr, "%s:%i", &Server.Address, &Server.Port);
+		hash = Utils_CRC32((const cc_uint8*)fullAddr.buffer, fullAddr.length);
 	}
 
+	Utils_EnsureDirectory("favblocks");
+	String_AppendConst(path, "favblocks/");
+	String_AppendUInt32(path, hash);
+	String_AppendConst(path, ".txt");
+}
+
+// Full LoadFavourites properly
+static void LoadFavouritesFile(void) {
+	cc_string path; char pathBuffer[256];
+	struct Stream s;
+	cc_string line; char lineBuffer[256];
+	BlockID block;
+	
+	favBlocksCount = 0;
+	String_InitArray(path, pathBuffer);
+	GetFavFilePath(&path);
+	
+	if (!Stream_OpenFile(&s, &path)) {
+		String_InitArray(line, lineBuffer);
+		while (!Stream_ReadLine(&s, &line)) {
+			if (!line.length) continue;
+			int parsedBlock;
+			if (Convert_ParseInt(&line, &parsedBlock) && parsedBlock >= 0 && parsedBlock < BLOCK_COUNT) {
+				favBlocks[favBlocksCount++] = (BlockID)parsedBlock;
+			}
+			line.length = 0;
+		}
+		s.Close(&s);
+	}
+}
+
+static void SaveFavourites(void) {
+	cc_string path; char pathBuffer[256];
+	struct Stream s;
+	cc_string line; char lineBuffer[256];
+	int i;
+	
+	String_InitArray(path, pathBuffer);
+	GetFavFilePath(&path);
+	
+	if (!Stream_CreateFile(&s, &path)) {
+		for (i = 0; i < favBlocksCount; i++) {
+			String_InitArray(line, lineBuffer);
+			String_AppendInt(&line, favBlocks[i]);
+			Stream_WriteLine(&s, &line);
+		}
+		s.Close(&s);
+	}
+}
+
+void ToggleFavourite(BlockID block) {
+	int i, j;
+	if (favBlocksCount == -1) LoadFavouritesFile();
+	
+	for (i = 0; i < favBlocksCount; i++) {
+		if (favBlocks[i] == block) {
+			for (j = i; j < favBlocksCount - 1; j++) {
+				favBlocks[j] = favBlocks[j + 1];
+			}
+			favBlocksCount--;
+			SaveFavourites();
+			return;
+		}
+	}
+	
+	if (favBlocksCount < BLOCK_COUNT) {
+		favBlocks[favBlocksCount++] = block;
+		SaveFavourites();
+	}
+}
+
+static cc_bool IsFavourited(BlockID block) {
+	int i;
+	if (favBlocksCount == -1) LoadFavouritesFile();
+	for (i = 0; i < favBlocksCount; i++) {
+		if (favBlocks[i] == block) return true;
+	}
+	return false;
+}
+
+static char Char_ToLowerEx(char c) {
+	return (c >= 'A' && c <= 'Z') ? (c + 32) : c;
+}
+
+static cc_bool String_WildcardMatch(const cc_string* text, const cc_string* pattern) {
+	int i = 0, j = 0;
+	int starIdx = -1;
+	int matchIdx = 0;
+	
+	while (i < text->length) {
+		if (j < pattern->length && (pattern->buffer[j] == '?' || Char_ToLowerEx(pattern->buffer[j]) == Char_ToLowerEx(text->buffer[i]))) {
+			i++;
+			j++;
+		} else if (j < pattern->length && pattern->buffer[j] == '*') {
+			starIdx = j;
+			matchIdx = i;
+			j++;
+		} else if (starIdx != -1) {
+			j = starIdx + 1;
+			matchIdx++;
+			i = matchIdx;
+		} else {
+			return false;
+		}
+	}
+	
+	while (j < pattern->length && pattern->buffer[j] == '*') {
+		j++;
+	}
+	
+	return j == pattern->length;
+}
+
+static cc_uint32 GetCurrentServerHash(void) {
+	if (Server.IsSinglePlayer) {
+		return Utils_CRC32((const cc_uint8*)Server.Name.buffer, Server.Name.length);
+	} else {
+		cc_string fullAddr; char fullAddrBuffer[256];
+		String_InitArray(fullAddr, fullAddrBuffer);
+		String_Format2(&fullAddr, "%s:%i", &Server.Address, &Server.Port);
+		return Utils_CRC32((const cc_uint8*)fullAddr.buffer, fullAddr.length);
+	}
+}
+
+static cc_uint32 lastServerHash = 0xFFFFFFFF;
+
+void TableWidget_RecreateBlocks(struct TableWidget* w) {
+	int max = Game_UseCPEBlocks ? BLOCK_MAX_DEFINED : BLOCK_MAX_ORIGINAL;
+	int i, rowEnd, matchCount = 0;
+	BlockID block;
+	cc_string name;
+	int filterId = -1;
+	static const cc_string str_invalid = String_FromConst("Invalid");
+	w->blocksCount = 0;
+
+	if (w->searchFilter.length) {
+		Convert_ParseInt(&w->searchFilter, &filterId);
+	}
+	
+	cc_uint32 currentHash = GetCurrentServerHash();
+	if (currentHash != lastServerHash) {
+		lastServerHash = currentHash;
+		favBlocksCount = -1;
+	}
+
+	if (inventoryFavsFilter) {
+		if (favBlocksCount == -1) LoadFavouritesFile();
+		for (i = 0; i < favBlocksCount; i++) {
+			block = favBlocks[i];
+			if (block > max) continue;
+			if (block == BLOCK_AIR) continue;
+
+			/* Filter matching */
+			if (w->searchFilter.length) {
+				name = Block_UNSAFE_GetName(block);
+				if (String_CaselessEquals(&name, &str_invalid)) continue;
+				if (String_IndexOf(&w->searchFilter, '*') >= 0 || String_IndexOf(&w->searchFilter, '?') >= 0) {
+					if (!String_WildcardMatch(&name, &w->searchFilter) && block != filterId) continue;
+				} else {
+					if (!String_CaselessContains(&name, &w->searchFilter) && block != filterId) continue;
+				}
+			}
+
+			/* Check if the matched block is within the current page */
+			if (matchCount >= w->pageIdx * 512 && matchCount < (w->pageIdx + 1) * 512) {
+				w->blocks[w->blocksCount++] = block;
+			}
+			matchCount++;
+		}
+	} else if (w->searchFilter.length) {
+		for (block = 1; block < max; block++) {
+			if (block == BLOCK_AIR) continue;
+
+			/* Filter matching */
+			name = Block_UNSAFE_GetName(block);
+			if (String_CaselessEquals(&name, &str_invalid)) continue;
+			if (String_IndexOf(&w->searchFilter, '*') >= 0 || String_IndexOf(&w->searchFilter, '?') >= 0) {
+				if (!String_WildcardMatch(&name, &w->searchFilter) && block != filterId) continue;
+			} else {
+				if (!String_CaselessContains(&name, &w->searchFilter) && block != filterId) continue;
+			}
+
+			/* Check if the matched block is within the current page */
+			if (matchCount >= w->pageIdx * 512 && matchCount < (w->pageIdx + 1) * 512) {
+				w->blocks[w->blocksCount++] = block;
+			}
+			matchCount++;
+		}
+	} else {
+		for (i = 0; i < Array_Elems(Inventory.Map);) {
+			cc_bool emptyRow = true;
+			int begMatch = matchCount;
+			int begBlocks = w->blocksCount;
+			int rowEnd = min(i + w->blocksPerRow, Array_Elems(Inventory.Map));
+
+			for (; i < rowEnd; i++) {
+				block = Inventory.Map[i];
+				if (block > max) continue;
+
+				if (matchCount >= w->pageIdx * 512 && matchCount < (w->pageIdx + 1) * 512) {
+					w->blocks[w->blocksCount++] = block;
+				}
+				matchCount++;
+				if (block != BLOCK_AIR) emptyRow = false;
+			}
+
+			if (emptyRow) {
+				matchCount = begMatch;
+				w->blocksCount = begBlocks;
+			}
+		}
+	}
+
+	if (w->pageIdx > 0 && w->pageIdx >= Math_CeilDiv(matchCount, 512)) {
+		w->pageIdx = Math_CeilDiv(matchCount, 512) - 1;
+		if (w->pageIdx < 0) w->pageIdx = 0;
+		/* Re-run to populate if we clamped */
+		TableWidget_RecreateBlocks(w);
+		return;
+	}
+
+	w->pageTotal = Math_CeilDiv(matchCount, 512);
+	if (w->pageTotal == 0) w->pageTotal = 1;
+	
 	w->rowsTotal = Math_CeilDiv(w->blocksCount, w->blocksPerRow);
 	Widget_Layout(w);
 }
@@ -894,11 +1115,11 @@ static void TableWidget_Reposition(void* widget) {
 
 	do {
 		w->width  = w->cellSizeX * w->blocksPerRow;
-		w->height = w->cellSizeY * w->rowsVisible;
+		w->height = w->cellSizeY * w->rowsVisible + w->topMargin;
 		Widget_CalcPosition(w);
 
-		/* Does the table fit on screen? */
-		if (classic || Table_Y(w) >= 0) break;
+		/* Does the table fit on screen? (Leaving 45px for top/bottom margins) */
+		if (classic || Table_Y(w) >= Display_ScaleY(45)) break;
 		w->rowsVisible--;
 	} while (w->rowsVisible > 1);
 
@@ -978,9 +1199,8 @@ static int TableWidget_PointerMove(void* widget, int id, int x, int y) {
 	w->selectedIndex = -1;
 	cellSizeX = w->cellSizeX;
 	cellSizeY = w->cellSizeY;
-	maxHeight = cellSizeY * w->rowsVisible;
 
-	if (Gui_Contains(w->x, w->y + 3, w->width, maxHeight - 3 * 2, x, y)) {
+	if (Gui_Contains(w->x, w->y + 3, w->width, w->rowsVisible * cellSizeY - 3 * 2, x, y)) {
 		for (i = 0; i < w->blocksCount; i++) {
 			TableWidget_GetCoords(w, i, &cellX, &cellY);
 

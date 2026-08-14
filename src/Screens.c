@@ -1711,13 +1711,19 @@ void SpecialTextScreen_Show(void) { }
 /*########################################################################################################################*
 *-----------------------------------------------------InventoryScreen-----------------------------------------------------*
 *#########################################################################################################################*/
+static char inventorySearchBuffer[INPUTWIDGET_LEN];
+static int inventoryPage = 0;
+
 static struct InventoryScreen {
 	Screen_Body
 	struct FontDesc font;
 	struct TableWidget table;
 	struct TextWidget title;
 	cc_bool releasedInv, deferredSelect;
-	struct Widget* __widgets[2];
+	struct TextInputWidget searchInput;
+	struct ButtonWidget pageLeft, pageRight, favsBtn;
+	struct TextWidget pageNum;
+	struct Widget* __widgets[7];
 } InventoryScreen CC_BIG_VAR;
 
 
@@ -1768,6 +1774,8 @@ static void InventoryScreen_ContextLost(void* screen) {
 	s->table.vb = 0;
 }
 
+static void InventoryScreen_UpdatePageText(struct InventoryScreen* s);
+
 static void InventoryScreen_ContextRecreated(void* screen) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
 	Screen_UpdateVb(s);
@@ -1775,6 +1783,12 @@ static void InventoryScreen_ContextRecreated(void* screen) {
 
 	Gui_MakeBodyFont(&s->font);
 	TableWidget_RecreateTitle(&s->table, true);
+	
+	TextInputWidget_SetFont(&s->searchInput, &s->font);
+	ButtonWidget_SetConst(&s->pageLeft, "<", &s->font);
+	ButtonWidget_SetConst(&s->pageRight, ">", &s->font);
+	ButtonWidget_SetConst(&s->favsBtn, "\x03 Favs", &s->font);
+	InventoryScreen_UpdatePageText(s);
 }
 
 static void InventoryScreen_MoveToSelected(struct InventoryScreen* s) {
@@ -1806,16 +1820,96 @@ static void InventoryScreen_MoveToSelected(struct InventoryScreen* s) {
 	}
 }
 
+static void InventoryScreen_UpdatePageText(struct InventoryScreen* s) {
+	cc_string text; char textBuffer[64];
+	int p = s->table.pageIdx + 1;
+	String_InitArray(text, textBuffer);
+	String_Format2(&text, "%i / %i", &p, &s->table.pageTotal);
+	TextWidget_Set(&s->pageNum, &text, &s->font);
+}
+
+static void InventoryScreen_Layout(void* screen);
+
+static void InventoryScreen_SearchChanged(void* elem) {
+	struct InventoryScreen* s = &InventoryScreen;
+	struct TextInputWidget* search = &s->searchInput;
+	
+	String_CopyToRawArray(inventorySearchBuffer, &search->base.text);
+	s->table.searchFilter = String_FromRawArray(inventorySearchBuffer);
+	s->table.searchFilter.length = search->base.text.length;
+	
+	inventoryPage = 0;
+	s->table.pageIdx = 0;
+	s->table.scroll.topRow = 0;
+	
+	TableWidget_RecreateBlocks(&s->table);
+	InventoryScreen_UpdatePageText(s);
+	InventoryScreen_Layout(s);
+}
+
+static void InventoryScreen_PageLeft(void* screen, void* widget) {
+	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	if (s->table.pageIdx > 0) {
+		inventoryPage = s->table.pageIdx - 1;
+		s->table.pageIdx = inventoryPage;
+		s->table.scroll.topRow = 0;
+		TableWidget_RecreateBlocks(&s->table);
+		InventoryScreen_UpdatePageText(s);
+	}
+}
+
+static void InventoryScreen_PageRight(void* screen, void* widget) {
+	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	if (s->table.pageIdx < s->table.pageTotal - 1) {
+		inventoryPage = s->table.pageIdx + 1;
+		s->table.pageIdx = inventoryPage;
+		s->table.scroll.topRow = 0;
+		TableWidget_RecreateBlocks(&s->table);
+		InventoryScreen_UpdatePageText(s);
+	}
+}
+
+extern cc_bool inventoryFavsFilter;
+static void InventoryScreen_ToggleFavs(void* screen, void* widget) {
+	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	inventoryFavsFilter = !inventoryFavsFilter;
+	s->table.pageIdx = 0;
+	s->table.scroll.topRow = 0;
+	inventoryPage = 0;
+	TableWidget_RecreateBlocks(&s->table);
+	InventoryScreen_UpdatePageText(s);
+	InventoryScreen_Layout(s);
+}
+
 static void InventoryScreen_Init(void* screen) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	struct MenuInputDesc searchDesc;
+	cc_string searchText;
+	
+	s->releasedInv = false;
 	s->widgets     = s->__widgets;
 	s->numWidgets  = 0;
 	s->maxWidgets  = Array_Elems(s->__widgets);
 	
-	TextWidget_Add(s,  &s->title);
 	TableWidget_Add(s, &s->table, 22 * Options_GetFloat(OPT_INV_SCROLLBAR_SCALE, 0, 10, 1));
+	TextWidget_Add(s,  &s->title);
 	s->table.blocksPerRow = Inventory.BlocksPerRow;
 	s->table.UpdateTitle   = InventoryScreen_OnUpdateTitle;
+	
+	MenuInput_String(searchDesc);
+	searchText = String_FromRawArray(inventorySearchBuffer);
+	searchText.length = String_Length(inventorySearchBuffer);
+	
+	TextInputWidget_Add(s, &s->searchInput, 250, &searchText, &searchDesc);
+	s->searchInput.base.OnTextChanged = InventoryScreen_SearchChanged;
+	
+	ButtonWidget_Add(s, &s->pageLeft, 30, InventoryScreen_PageLeft);
+	ButtonWidget_Add(s, &s->pageRight, 30, InventoryScreen_PageRight);
+	ButtonWidget_Add(s, &s->favsBtn, 80, InventoryScreen_ToggleFavs);
+	TextWidget_Add(s, &s->pageNum);
+	
+	s->table.searchFilter = searchText;
+	s->table.pageIdx = inventoryPage;
 	TableWidget_RecreateBlocks(&s->table);
 
 	/* Can't immediately move to selected here, because cursor grabbed  */
@@ -1845,19 +1939,43 @@ static void InventoryScreen_Update(void* screen, float delta) {
 
 static void InventoryScreen_Render(void* screen, float delta) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
-	Widget_Render2(&s->table, TEXTWIDGET_MAX);
-	Widget_Render2(&s->title,              0);
+	if (Game_ClassicMode) {
+		Gfx_Draw2DFlat(0, 0, Window_Main.Width, Window_Main.Height, PackedCol_Make(0, 0, 0, 153));
+	}
+	
+	Screen_Render2Widgets(screen, delta);
 }
 
 static void InventoryScreen_Layout(void* screen) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
 	s->table.scale = Gui_GetInventoryScale();
+	s->table.topMargin = 0;
 	Widget_SetLocation(&s->table, ANCHOR_CENTRE, ANCHOR_CENTRE, 0, 0);
+	Widget_Layout(&s->table);
 
 	Widget_SetLocation(&s->title, ANCHOR_CENTRE, ANCHOR_MIN, 0, 0);
-	/* use Table(Y) directly instead of s->title->height ??? */
-	s->title.yOffset = s->table.y - s->title.height - 3;
-	Widget_Layout(&s->title); /* Needed for yOffset */
+	s->title.yOffset = s->table.y - s->title.height - Display_ScaleY(10);
+	Widget_Layout(&s->title);
+
+	Widget_SetLocation(&s->searchInput, ANCHOR_CENTRE, ANCHOR_MIN, -110, 0);
+	s->searchInput.base.yOffset = s->table.y + s->table.height + Display_ScaleY(25);
+	Widget_Layout((struct Widget*)&s->searchInput);
+
+	Widget_SetLocation(&s->pageLeft, ANCHOR_CENTRE, ANCHOR_MIN, 50, 0);
+	s->pageLeft.yOffset = s->searchInput.base.yOffset;
+	Widget_Layout(&s->pageLeft);
+
+	Widget_SetLocation(&s->pageNum, ANCHOR_CENTRE, ANCHOR_MIN, 90, 0);
+	s->pageNum.yOffset = s->searchInput.base.yOffset + Display_ScaleY(5);
+	Widget_Layout(&s->pageNum);
+
+	Widget_SetLocation(&s->pageRight, ANCHOR_CENTRE, ANCHOR_MIN, 130, 0);
+	s->pageRight.yOffset = s->searchInput.base.yOffset;
+	Widget_Layout(&s->pageRight);
+
+	Widget_SetLocation(&s->favsBtn, ANCHOR_CENTRE, ANCHOR_MIN, 190, 0);
+	s->favsBtn.yOffset = s->searchInput.base.yOffset;
+	Widget_Layout(&s->favsBtn);
 }
 
 static int InventoryScreen_KeyDown(void* screen, int key, struct InputDevice* device) {
@@ -1868,10 +1986,15 @@ static int InventoryScreen_KeyDown(void* screen, int key, struct InputDevice* de
 	if (InputBind_Claims(BIND_INVENTORY, key, device) && s->releasedInv && !Game_ClassicMode) {
 		Gui_Remove((struct Screen*)s);
 		CPE_SendNotifyAction(NOTIFY_ACTION_BLOCK_LIST_TOGGLED, 0);
+	} else if (key == CCMOUSE_M && table->selectedIndex != -1) {
+		extern void ToggleFavourite(BlockID block);
+		ToggleFavourite(table->blocks[table->selectedIndex]);
+		TableWidget_RecreateTitle(table, false);
 	} else if (InputDevice_IsEnter(key, device) && table->selectedIndex != -1) {
 		Inventory_SetSelectedBlock(table->blocks[table->selectedIndex]);
 		Gui_Remove((struct Screen*)s);
 		CPE_SendNotifyAction(NOTIFY_ACTION_BLOCK_LIST_TOGGLED, 0);
+	} else if (Elem_HandlesKeyDown((struct Widget*)&s->searchInput, key, device)) {
 	} else if (Elem_HandlesKeyDown(table, key, device)) {
 	} else {
 		return Elem_HandlesKeyDown(&HUDScreen_Instance.hotbar, key, device);
@@ -1890,6 +2013,19 @@ static void InventoryScreen_KeyUp(void* screen, int key, struct InputDevice* dev
 	if (InputBind_Claims(BIND_INVENTORY, key, device)) s->releasedInv = true;
 }
 
+static int InventoryScreen_HandlesKeyPress(void* screen, char keyChar) {
+	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	if (!s->releasedInv) return true;
+	InputWidget_Append(&s->searchInput.base, keyChar);
+	return true;
+}
+
+static int InventoryScreen_HandlesTextChanged(void* screen, const cc_string* str) {
+	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	InputWidget_SetText(&s->searchInput.base, str);
+	return true;
+}
+
 static int InventoryScreen_PointerDown(void* screen, int id, int x, int y) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
 	struct TableWidget* table = &s->table;
@@ -1897,6 +2033,24 @@ static int InventoryScreen_PointerDown(void* screen, int id, int x, int y) {
 
 	if (table->scroll.draggingId == id) return TOUCH_TYPE_GUI;
 	if (HUDscreen_PointerDown(Gui_HUD, id, x, y)) return TOUCH_TYPE_GUI;
+	
+	if (Widget_Contains(&s->searchInput, x, y)) {
+		Elem_HandlesPointerDown((struct Widget*)&s->searchInput, id, x, y);
+		return TOUCH_TYPE_GUI;
+	}
+	if (Widget_Contains(&s->pageLeft, x, y)) {
+		if (s->pageLeft.MenuClick) s->pageLeft.MenuClick(s, &s->pageLeft);
+		return TOUCH_TYPE_GUI;
+	}
+	if (Widget_Contains(&s->pageRight, x, y)) {
+		if (s->pageRight.MenuClick) s->pageRight.MenuClick(s, &s->pageRight);
+		return TOUCH_TYPE_GUI;
+	}
+	if (Widget_Contains(&s->favsBtn, x, y)) {
+		if (s->favsBtn.MenuClick) s->favsBtn.MenuClick(s, &s->favsBtn);
+		return TOUCH_TYPE_GUI;
+	}
+
 	handled = Elem_HandlesPointerDown(table, id, x, y);
 
 	if (!handled || table->pendingClose) {
@@ -1911,11 +2065,19 @@ static int InventoryScreen_PointerDown(void* screen, int id, int x, int y) {
 
 static void InventoryScreen_PointerUp(void* screen, int id, int x, int y) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	Elem_OnPointerUp((struct Widget*)&s->searchInput, id, x, y);
+	Elem_OnPointerUp(&s->pageLeft, id, x, y);
+	Elem_OnPointerUp(&s->pageRight, id, x, y);
+	Elem_OnPointerUp(&s->favsBtn, id, x, y);
 	Elem_OnPointerUp(&s->table, id, x, y);
 }
 
 static int InventoryScreen_PointerMove(void* screen, int id, int x, int y) {
 	struct InventoryScreen* s = (struct InventoryScreen*)screen;
+	if (Elem_HandlesPointerMove((struct Widget*)&s->searchInput, id, x, y)) return true;
+	if (Elem_HandlesPointerMove(&s->pageLeft, id, x, y)) return true;
+	if (Elem_HandlesPointerMove(&s->pageRight, id, x, y)) return true;
+	if (Elem_HandlesPointerMove(&s->favsBtn, id, x, y)) return true;
 	return Elem_HandlesPointerMove(&s->table, id, x, y);
 }
 
@@ -1936,7 +2098,7 @@ static int InventoryScreen_PadAxis(void* screen, struct PadAxisUpdate* upd) {
 static const struct ScreenVTABLE InventoryScreen_VTABLE = {
 	InventoryScreen_Init,        InventoryScreen_Update,    InventoryScreen_Free,
 	InventoryScreen_Render,      Screen_BuildMesh,
-	InventoryScreen_KeyDown,     InventoryScreen_KeyUp,     Screen_TKeyPress,            Screen_TText,
+	InventoryScreen_KeyDown,     InventoryScreen_KeyUp,     InventoryScreen_HandlesKeyPress,     InventoryScreen_HandlesTextChanged,
 	InventoryScreen_PointerDown, InventoryScreen_PointerUp, InventoryScreen_PointerMove, InventoryScreen_MouseScroll,
 	InventoryScreen_Layout,  InventoryScreen_ContextLost, InventoryScreen_ContextRecreated,
 	InventoryScreen_PadAxis
